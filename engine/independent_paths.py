@@ -1,8 +1,53 @@
-﻿
-from collections import defaultdict
+﻿from collections import defaultdict
+from collections.abc import Iterable
+from types import SimpleNamespace
 
 from engine.complexity import calculate_complexity
 from engine.linear_algebra import binary_rank
+
+
+def _normalize_cfg(cfg):
+    """Return CFG nodes and edges in the format used by this module."""
+    raw_nodes = cfg.nodes
+    node_items = (
+        raw_nodes.items()
+        if isinstance(raw_nodes, dict)
+        else ((None, node) for node in raw_nodes)
+    )
+
+    nodes = {}
+    for node_key, node in node_items:
+        node_id = getattr(node, "id", getattr(node, "node_id", node_key))
+        label = getattr(
+            node,
+            "label",
+            node if isinstance(node, str) else None,
+        )
+        if node_id is None or label is None:
+            raise ValueError("CFG nodes must provide an ID and label")
+        nodes[node_id] = SimpleNamespace(id=node_id, label=label)
+
+    edges = getattr(cfg, "edges", None)
+    if edges is None:
+        get_edges = getattr(cfg, "get_edges", None)
+        if not callable(get_edges):
+            raise TypeError("CFG must provide edges or a get_edges() method")
+        edges = get_edges()
+    if not isinstance(edges, Iterable):
+        raise TypeError("CFG edges must be an iterable collection")
+
+    normalized_edges = []
+    for edge in edges:
+        if not isinstance(edge, (list, tuple)) or len(edge) < 2:
+            raise ValueError("CFG edges must contain source and target IDs")
+        try:
+            source, target, *metadata = edge
+        except ValueError as error:
+            raise ValueError("CFG edges must contain source and target IDs") from error
+        label = metadata[0] if metadata else ""
+        normalized_edges.append((source, target, label))
+
+    return nodes, normalized_edges
 
 
 def find_all_paths(
@@ -28,14 +73,14 @@ def find_all_paths(
     if max_candidates < 1:
         raise ValueError("max_candidates must be at least 1")
 
-    nodes = {node.id: node for node in cfg.nodes}
+    nodes, edges = _normalize_cfg(cfg)
 
     entries = [
-        node.id for node in cfg.nodes
+        node.id for node in nodes.values()
         if node.label == entry_label
     ]
     exits = [
-        node.id for node in cfg.nodes
+        node.id for node in nodes.values()
         if node.label == exit_label
     ]
 
@@ -47,14 +92,14 @@ def find_all_paths(
 
     adjacency = defaultdict(list)
 
-    for edge_index, (source, target, label) in enumerate(cfg.edges):
+    for edge_index, (source, target, label) in enumerate(edges):
         adjacency[source].append((edge_index, target, label))
 
     paths = []
-    edge_counts = [0] * len(cfg.edges)
+    edge_counts = [0] * len(edges)
     seen_vectors = set()
 
-    max_length = max(1, len(cfg.edges) * max_edge_uses)
+    max_length = max(1, len(edges) * max_edge_uses)
 
     def dfs(current, node_path, edge_path):
         if len(paths) >= max_candidates:
@@ -63,7 +108,7 @@ def find_all_paths(
         if current == exit_node:
             vector = _edge_parity_vector(
                 edge_path,
-                len(cfg.edges),
+                len(edges),
             )
             vector_key = tuple(vector)
 
@@ -123,6 +168,7 @@ def _select_independent_path_ids(cfg):
     does not guarantee completeness for arbitrary CFGs.
     """
     all_paths, _nodes = find_all_paths(cfg)
+    _nodes, edges = _normalize_cfg(cfg)
 
     selected_paths = []
     selected_vectors = []
@@ -133,7 +179,7 @@ def _select_independent_path_ids(cfg):
     for node_path, edge_path in all_paths:
         vector = _edge_parity_vector(
             edge_path,
-            len(cfg.edges),
+            len(edges),
         )
 
         new_rank = binary_rank(selected_vectors + [vector])
@@ -160,7 +206,7 @@ def find_independent_paths(cfg):
     """Return selected paths as readable node labels."""
     selected_paths, _rank, _expected = _select_independent_path_ids(cfg)
 
-    nodes = {node.id: node for node in cfg.nodes}
+    nodes, _edges = _normalize_cfg(cfg)
 
     return [
         [nodes[node_id].label for node_id in path]
@@ -189,14 +235,14 @@ def build_fundamental_cycle_basis(
         These are undirected cycle-space vectors, not necessarily
         valid directed execution paths.
     """
-    nodes = {node.id: node for node in cfg.nodes}
+    nodes, cfg_edges = _normalize_cfg(cfg)
 
     entries = [
-        node.id for node in cfg.nodes
+        node.id for node in nodes.values()
         if node.label == entry_label
     ]
     exits = [
-        node.id for node in cfg.nodes
+        node.id for node in nodes.values()
         if node.label == exit_label
     ]
 
@@ -214,7 +260,7 @@ def build_fundamental_cycle_basis(
             "label": label,
             "virtual": False,
         }
-        for index, (source, target, label) in enumerate(cfg.edges)
+        for index, (source, target, label) in enumerate(cfg_edges)
     ]
 
     virtual_edge_id = len(edges)
@@ -375,14 +421,11 @@ def build_fundamental_cycle_basis(
 
 
 if __name__ == "__main__":
-    from frontend.cpp.cfg_builder import CFGBuilder
+    from frontend.cpp.parser import CppParser
 
     filename = "examples/nested_loops.cpp"
 
-    with open(filename, encoding="utf-8") as file:
-        code = file.read()
-
-    cfg = CFGBuilder().build(code)
+    cfg = CppParser().build_cfg(filename)
 
     print(
         "Cyclomatic Complexity:",

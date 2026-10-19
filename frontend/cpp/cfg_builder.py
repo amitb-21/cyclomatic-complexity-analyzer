@@ -1,71 +1,55 @@
+from typing import Optional
+from frontend.base_parser import CFG, CFGNode
 
-from dataclasses import dataclass, field
-
-from tree_sitter import Language, Parser
-import tree_sitter_cpp as tscpp
-
-
-@dataclass
-class Node:
-    id: int
-    label: str
-
-
-@dataclass
-class CFG:
-    nodes: list = field(default_factory=list)
-    edges: list = field(default_factory=list)
-
-
-class CFGBuilder:
-    def __init__(self):
-        self.parser = Parser(Language(tscpp.language()))
+class CppCFGBuilder:
+    def __init__(self, source_bytes: bytes):
         self.cfg = CFG()
         self.next_id = 1
         self.exit_node = None
         self.loop_stack = []
+        self.source_bytes = source_bytes
 
-    def add_node(self, label):
-        node_id = self.next_id
+    def add_node(self, label: str) -> CFGNode:
+        """Creates a standardized CFGNode, adds it to the graph, and returns the object."""
+        node = CFGNode(self.next_id, label)
+        self.cfg.add_node(node)
         self.next_id += 1
-        self.cfg.nodes.append(Node(node_id, label))
-        return node_id
+        return node
 
-    def add_edge(self, source, target, label=""):
-        edge = (source, target, label)
-        if edge not in self.cfg.edges:
-            self.cfg.edges.append(edge)
+    def add_edge(self, source: Optional[CFGNode], target: Optional[CFGNode], label: str = ""):
+        """Links two nodes together. Safely ignores None values."""
+        if source is not None and target is not None:
+            self.cfg.add_edge(source, target, label)
 
-    @staticmethod
-    def text(node, source):
-        return source[node.start_byte:node.end_byte].decode(
-            "utf-8"
-        ).strip() if node is not None else ""
+    def text(self, node) -> str:
+        """Extracts the raw string from the source bytes."""
+        if node is None:
+            return ""
+        return self.source_bytes[node.start_byte:node.end_byte].decode("utf-8").strip()
 
-    def build(self, code):
-        source = code.encode("utf-8")
-        tree = self.parser.parse(source)
-
-        self.cfg = CFG()
-        self.next_id = 1
-        self.loop_stack = []
-
-        if tree.root_node.has_error:
+    def build(self, root_node) -> CFG:
+        """Main entry point to begin traversing the Tree-sitter AST."""
+        if root_node.has_error:
             raise ValueError("C++ source contains syntax errors")
 
+        # Extract function definitions
         functions = [
-            child for child in tree.root_node.named_children
+            child for child in root_node.named_children
             if child.type == "function_definition"
         ]
 
         if not functions:
             raise ValueError("No function definition found")
 
+        # Initialize Standardized Entry and Exit points
         entry = self.add_node("Entry")
         self.exit_node = self.add_node("Exit")
+        
+        self.cfg.start_node = entry
+        self.cfg.end_node = self.exit_node
 
         body = functions[0].child_by_field_name("body")
-        tails = self.process_block(body, [entry], source)
+        tails = self.process_block(body, [entry])
 
         for tail in tails:
             self.add_edge(tail, self.exit_node)
@@ -76,71 +60,81 @@ class CFGBuilder:
     # Statement blocks
     # ---------------------------------------------------------
 
-    def process_block(self, block, incoming, source):
+    def process_block(self, block, incoming: list[CFGNode]) -> list[CFGNode]:
         if block is None:
             return incoming
 
+        statements = (
+            block.named_children
+            if block.type == "compound_statement"
+            else [block]
+        )
+        return self.process_statements(statements, incoming)
+
+    def process_statements(self, statements, incoming: list[CFGNode]) -> list[CFGNode]:
         tails = incoming
 
-        for statement in block.named_children:
+        for statement in statements:
             if not tails:
                 break
 
             kind = statement.type
 
             if kind == "if_statement":
-                tails = self.process_if(statement, tails, source)
+                tails = self.process_if(statement, tails)
 
             elif kind == "while_statement":
-                tails = self.process_while(statement, tails, source)
+                tails = self.process_while(statement, tails)
+
+            elif kind == "do_statement":
+                tails = self.process_do_while(statement, tails)
 
             elif kind == "for_statement":
-                tails = self.process_for(statement, tails, source)
+                tails = self.process_for(statement, tails)
+
+            elif kind == "switch_statement":
+                tails = self.process_switch(statement, tails)
 
             elif kind == "return_statement":
-                node_id = self.add_node(self.text(statement, source))
+                ret_node = self.add_node(self.text(statement))
                 for tail in tails:
-                    self.add_edge(tail, node_id)
-                self.add_edge(node_id, self.exit_node)
+                    self.add_edge(tail, ret_node)
+                self.add_edge(ret_node, self.exit_node)
                 tails = []
 
             elif kind == "break_statement":
-                node_id = self.add_node("break;")
+                brk_node = self.add_node("break;")
                 for tail in tails:
-                    self.add_edge(tail, node_id)
+                    self.add_edge(tail, brk_node)
 
                 if self.loop_stack:
-                    self.add_edge(
-                        node_id, self.loop_stack[-1]["break_target"]
-                    )
+                    self.add_edge(brk_node, self.loop_stack[-1]["break_target"])
                 tails = []
 
             elif kind == "continue_statement":
-                node_id = self.add_node("continue;")
+                cont_node = self.add_node("continue;")
                 for tail in tails:
-                    self.add_edge(tail, node_id)
+                    self.add_edge(tail, cont_node)
 
                 if self.loop_stack:
                     target = self.loop_stack[-1]["continue_target"]
                     if target is not None:
-                        self.add_edge(node_id, target)
+                        self.add_edge(cont_node, target)
                 tails = []
 
             elif kind == "compound_statement":
-                tails = self.process_block(statement, tails, source)
+                tails = self.process_block(statement, tails)
 
             else:
-                node_id = self.add_node(self.text(statement, source))
+                stmt_node = self.add_node(self.text(statement))
                 for tail in tails:
-                    self.add_edge(tail, node_id)
-                tails = [node_id]
+                    self.add_edge(tail, stmt_node)
+                tails = [stmt_node]
 
         return tails
 
     # ---------------------------------------------------------
     # Boolean condition builder
-    # Connect each atomic condition to explicit true/false
-    # destinations. Handles &&, ||, and parentheses.
     # ---------------------------------------------------------
 
     def unwrap_condition(self, node):
@@ -154,7 +148,7 @@ class CFGBuilder:
             node = children[0]
         return node
 
-    def build_condition(self, node, incoming, true_target, false_target, source):
+    def build_condition(self, node, incoming: list[CFGNode], true_target: CFGNode, false_target: CFGNode):
         node = self.unwrap_condition(node)
 
         if node is None:
@@ -178,27 +172,17 @@ class CFGBuilder:
                 left, right = operands[0], operands[-1]
 
                 if operator == "&&":
-                    # If left is true, evaluate right.
                     right_entry = self.add_node("AND next")
-                    self.build_condition(
-                        left, incoming, right_entry, false_target, source
-                    )
-                    self.build_condition(
-                        right, [right_entry], true_target, false_target, source
-                    )
+                    self.build_condition(left, incoming, right_entry, false_target)
+                    self.build_condition(right, [right_entry], true_target, false_target)
                 else:
-                    # If left is false, evaluate right.
                     right_entry = self.add_node("OR next")
-                    self.build_condition(
-                        left, incoming, true_target, right_entry, source
-                    )
-                    self.build_condition(
-                        right, [right_entry], true_target, false_target, source
-                    )
+                    self.build_condition(left, incoming, true_target, right_entry)
+                    self.build_condition(right, [right_entry], true_target, false_target)
                 return
 
-        # Atomic decision node.
-        decision = self.add_node(self.text(node, source))
+        # Atomic decision node
+        decision = self.add_node(self.text(node))
         for tail in incoming:
             self.add_edge(tail, decision)
         self.add_edge(decision, true_target, "True")
@@ -208,7 +192,7 @@ class CFGBuilder:
     # If / else
     # ---------------------------------------------------------
 
-    def process_if(self, statement, incoming, source):
+    def process_if(self, statement, incoming: list[CFGNode]):
         condition = statement.child_by_field_name("condition")
         consequence = statement.child_by_field_name("consequence")
         alternative = statement.child_by_field_name("alternative")
@@ -216,13 +200,9 @@ class CFGBuilder:
         true_gate = self.add_node("True branch")
         false_gate = self.add_node("False branch")
 
-        self.build_condition(
-            condition, incoming, true_gate, false_gate, source
-        )
+        self.build_condition(condition, incoming, true_gate, false_gate)
 
-        true_tails = self.process_block(
-            consequence, [true_gate], source
-        )
+        true_tails = self.process_block(consequence, [true_gate])
 
         if alternative is not None:
             else_block = alternative
@@ -237,9 +217,7 @@ class CFGBuilder:
                     ),
                     None,
                 )
-            false_tails = self.process_block(
-                else_block, [false_gate], source
-            )
+            false_tails = self.process_block(else_block, [false_gate])
         else:
             false_tails = [false_gate]
 
@@ -249,7 +227,7 @@ class CFGBuilder:
     # While loop
     # ---------------------------------------------------------
 
-    def process_while(self, statement, incoming, source):
+    def process_while(self, statement, incoming: list[CFGNode]):
         condition = statement.child_by_field_name("condition")
         body = statement.child_by_field_name("body")
 
@@ -260,16 +238,14 @@ class CFGBuilder:
             self.add_edge(tail, condition_entry)
 
         body_entry = self.add_node("While body")
-        self.build_condition(
-            condition, [condition_entry], body_entry, after_loop, source
-        )
+        self.build_condition(condition, [condition_entry], body_entry, after_loop)
 
         self.loop_stack.append({
             "break_target": after_loop,
             "continue_target": condition_entry,
         })
 
-        body_tails = self.process_block(body, [body_entry], source)
+        body_tails = self.process_block(body, [body_entry])
 
         self.loop_stack.pop()
 
@@ -278,11 +254,108 @@ class CFGBuilder:
 
         return [after_loop]
 
+    def process_do_while(self, statement, incoming: list[CFGNode]):
+        body = statement.child_by_field_name("body")
+        condition = statement.child_by_field_name("condition")
+
+        body_entry = self.add_node("Do-while body")
+        condition_entry = self.add_node("Do-while condition")
+        after_loop = self.add_node("After do-while")
+
+        for tail in incoming:
+            self.add_edge(tail, body_entry)
+
+        self.loop_stack.append({
+            "break_target": after_loop,
+            "continue_target": condition_entry,
+        })
+        body_tails = self.process_block(body, [body_entry])
+        self.loop_stack.pop()
+
+        for tail in body_tails:
+            self.add_edge(tail, condition_entry)
+
+        self.build_condition(
+            condition,
+            [condition_entry],
+            body_entry,
+            after_loop,
+        )
+        return [after_loop]
+
+    def process_switch(self, statement, incoming: list[CFGNode]):
+        condition = statement.child_by_field_name("condition")
+        body = statement.child_by_field_name("body")
+        body_statements = (
+            body.named_children
+            if body is not None and body.type == "compound_statement"
+            else [body] if body is not None else []
+        )
+        cases = [
+            child for child in body_statements
+            if child.type == "case_statement"
+        ]
+
+        selector = self.add_node(f"Switch {self.text(condition)}")
+        after_switch = self.add_node("After switch")
+        for tail in incoming:
+            self.add_edge(tail, selector)
+
+        case_entries = []
+        has_default = False
+        for case in cases:
+            value = case.child_by_field_name("value")
+            is_default = value is None
+            has_default = has_default or is_default
+            label = "Default" if is_default else f"Case {self.text(value)}"
+            case_entry = self.add_node(label)
+            self.add_edge(selector, case_entry, label)
+
+            statements = [
+                child for child in case.named_children
+                if value is None
+                or (child.start_byte, child.end_byte)
+                != (value.start_byte, value.end_byte)
+            ]
+            case_entries.append((case_entry, statements))
+
+        if not has_default:
+            self.add_edge(selector, after_switch, "No matching case")
+
+        continue_target = next(
+            (
+                context["continue_target"]
+                for context in reversed(self.loop_stack)
+                if context["continue_target"] is not None
+            ),
+            None,
+        )
+        self.loop_stack.append({
+            "break_target": after_switch,
+            "continue_target": continue_target,
+        })
+
+        fallthrough_tails = []
+        for case_entry, case_statements in case_entries:
+            for tail in fallthrough_tails:
+                self.add_edge(tail, case_entry)
+            fallthrough_tails = self.process_statements(
+                case_statements,
+                [case_entry],
+            )
+
+        self.loop_stack.pop()
+
+        for tail in fallthrough_tails:
+            self.add_edge(tail, after_switch)
+
+        return [after_switch]
+
     # ---------------------------------------------------------
     # For loop
     # ---------------------------------------------------------
 
-    def process_for(self, statement, incoming, source):
+    def process_for(self, statement, incoming: list[CFGNode]):
         initializer = statement.child_by_field_name("initializer")
         condition = statement.child_by_field_name("condition")
         update = statement.child_by_field_name("update")
@@ -291,10 +364,10 @@ class CFGBuilder:
         tails = incoming
 
         if initializer is not None:
-            init_id = self.add_node(self.text(initializer, source))
+            init_node = self.add_node(self.text(initializer))
             for tail in tails:
-                self.add_edge(tail, init_id)
-            tails = [init_id]
+                self.add_edge(tail, init_node)
+            tails = [init_node]
 
         condition_entry = self.add_node("For condition")
         for tail in tails:
@@ -304,31 +377,27 @@ class CFGBuilder:
         body_entry = self.add_node("For body")
 
         if condition is not None:
-            self.build_condition(
-                condition, [condition_entry], body_entry, after_loop, source
-            )
+            self.build_condition(condition, [condition_entry], body_entry, after_loop)
         else:
             self.add_edge(condition_entry, body_entry, "True")
 
-        update_id = None
+        update_node = None
         if update is not None:
-            update_id = self.add_node(self.text(update, source))
+            update_node = self.add_node(self.text(update))
 
         self.loop_stack.append({
             "break_target": after_loop,
-            "continue_target": (
-                update_id if update_id is not None else condition_entry
-            ),
+            "continue_target": update_node if update_node is not None else condition_entry,
         })
 
-        body_tails = self.process_block(body, [body_entry], source)
+        body_tails = self.process_block(body, [body_entry])
 
         self.loop_stack.pop()
 
-        if update_id is not None:
+        if update_node is not None:
             for tail in body_tails:
-                self.add_edge(tail, update_id)
-            self.add_edge(update_id, condition_entry, "Back")
+                self.add_edge(tail, update_node)
+            self.add_edge(update_node, condition_entry, "Back")
         else:
             for tail in body_tails:
                 self.add_edge(tail, condition_entry, "Back")
@@ -336,30 +405,7 @@ class CFGBuilder:
         return [after_loop]
 
 
-if __name__ == "__main__":
-    code = """
-    int main() {
-        int x = 5;
-        int y = 10;
-
-        if (x > 0 && y > 0) {
-            x++;
-        }
-
-        if (x > 0 || y < 0) {
-            y++;
-        }
-
-        return 0;
-    }
-    """
-
-    cfg = CFGBuilder().build(code)
-
-    print("NODES")
-    for node in cfg.nodes:
-        print(f"{node.id}: {node.label}")
-
-    print("\\nEDGES")
-    for source, target, label in cfg.edges:
-        print(f"{source} -> {target} [{label}]")
+def build_cpp_cfg(root_node, source_bytes: bytes) -> CFG:
+    """Entry point called by CppParser."""
+    builder = CppCFGBuilder(source_bytes)
+    return builder.build(root_node)

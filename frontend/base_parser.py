@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 
 class CFGNode:
     """A language-agnostic representation of a code block or statement."""
@@ -16,12 +16,17 @@ class CFG:
     """The standardized Control Flow Graph expected by the math engine."""
     def __init__(self):
         self.nodes: Dict[int, CFGNode] = {}
-        # Using Optional resolves the Pylance "None is not assignable" error
+        self.edge_labels: Dict[Tuple[int, int], str] = {}
         self.start_node: Optional[CFGNode] = None 
         self.end_node: Optional[CFGNode] = None
         
     def add_node(self, node: CFGNode):
         self.nodes[node.node_id] = node
+
+    def add_edge(self, source: CFGNode, target: CFGNode, label: str = ""):
+        source.add_successor(target)
+        if label:
+            self.edge_labels[(source.node_id, target.node_id)] = label
 
     def get_edges(self) -> List[Tuple[int, int]]:
         """Returns a list of all directed edges (source_id, target_id) for matrix calculations."""
@@ -35,7 +40,7 @@ class BaseParser(ABC):
     """Abstract interface enforcing required methods for all language frontends."""
     
     @abstractmethod
-    def parse(self, file_path: str):
+    def parse(self, file_path: str) -> Any:
         """
         Reads the source file and converts it into a language-specific 
         Abstract Syntax Tree (AST) or token stream.

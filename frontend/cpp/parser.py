@@ -16,9 +16,9 @@ class CppParser(BaseParser):
 
     def parse(self, file_path: str):
         """Reads the source file and returns the Tree-sitter AST."""
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, 'rb') as f:
             source_code = f.read()
-        return self.parser.parse(source_code.encode("utf-8"))
+        return self.parser.parse(source_code)
 
     def build_cfg(self, file_path: str) -> CFG:
         """
