@@ -1,3 +1,6 @@
 ﻿streamlit
 graphviz
 pytest
+tree-sitter
+tree-sitter-cpp
+tree-sitter-java

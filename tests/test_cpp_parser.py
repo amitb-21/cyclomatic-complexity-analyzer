@@ -1,4 +1,9 @@
+import shutil
+
 import pytest
+
+from engine.complexity import calculate_complexity
+from engine.independent_paths import find_independent_paths
 from frontend.cpp.parser import CppParser
 
 @pytest.fixture
@@ -177,3 +182,176 @@ class TestCppParser:
         
         with pytest.raises(ValueError, match=r"C\+\+ source contains syntax errors"):
             parser.build_cfg(file_path)
+
+    def test_multiple_functions_are_included_in_file_complexity(self, parser, tmp_path):
+        code = """
+        int first(int x) {
+            if (x > 0) return 1;
+            return 0;
+        }
+        int second(int x) {
+            while (x > 0) x--;
+            return x;
+        }
+        """
+        cfg = parser.build_cfg(write_temp_cpp(tmp_path, code))
+
+        assert calculate_complexity(cfg)["complexity"] == 4
+        assert any(label.startswith("function:") for label in cfg.edge_labels.values())
+
+    def test_switch_break_targets_switch_inside_loop(self, parser, tmp_path):
+        code = """
+        int run(int x) {
+            while (x > 0) {
+                switch (x) {
+                    case 1: break;
+                    default: x--;
+                }
+                x--;
+            }
+            return x;
+        }
+        """
+        cfg = parser.build_cfg(write_temp_cpp(tmp_path, code))
+        after_switch = next(
+            node for node in cfg.nodes.values()
+            if node.label == "After switch"
+        )
+        break_node = next(
+            node for node in cfg.nodes.values()
+            if node.label == "break;"
+        )
+        after_loop = next(
+            node for node in cfg.nodes.values()
+            if node.label == "After while"
+        )
+        loop_condition_entry = next(
+            node for node in cfg.nodes.values()
+            if node.label == "While condition"
+        )
+        condition_decision = next(
+            node for node in cfg.nodes.values()
+            if node.label == "x > 0"
+        )
+        post_switch_statement = after_switch.successors[0]
+
+        assert break_node.successors == [after_switch]
+        assert post_switch_statement.label == "x--;"
+        assert post_switch_statement.successors == [loop_condition_entry]
+        assert condition_decision in loop_condition_entry.successors
+        assert after_loop in condition_decision.successors
+
+    def test_forward_goto_connects_to_labeled_statement(self, parser, tmp_path):
+        code = """
+        int run(int value) {
+            if (value < 0) {
+                goto finish;
+            }
+            value++;
+        finish:
+            return value;
+        }
+        """
+        cfg = parser.build_cfg(write_temp_cpp(tmp_path, code))
+        goto = next(node for node in cfg.nodes.values() if node.label == "goto finish;")
+        label = next(node for node in cfg.nodes.values() if node.label == "Label finish")
+        returned = next(node for node in cfg.nodes.values() if node.label == "return value;")
+
+        assert goto.successors == [label]
+        assert returned in label.successors
+        assert calculate_complexity(cfg)["complexity"] == 2
+        assert len(find_independent_paths(cfg)) == 2
+
+    def test_backward_goto_creates_a_control_flow_cycle(self, parser, tmp_path):
+        code = """
+        int run(int value) {
+        again:
+            if (value > 0) {
+                value--;
+                goto again;
+            }
+            return value;
+        }
+        """
+        cfg = parser.build_cfg(write_temp_cpp(tmp_path, code))
+        goto = next(node for node in cfg.nodes.values() if node.label == "goto again;")
+        label = next(node for node in cfg.nodes.values() if node.label == "Label again")
+
+        assert goto.successors == [label]
+        assert calculate_complexity(cfg)["complexity"] == 2
+        assert len(find_independent_paths(cfg)) == 2
+
+    def test_goto_reaches_label_nested_in_unreachable_block(self, parser, tmp_path):
+        code = """
+        int run(int value) {
+            goto nested;
+            if (value > 0) {
+            nested:
+                return value;
+            }
+        }
+        """
+        cfg = parser.build_cfg(write_temp_cpp(tmp_path, code))
+        goto = next(node for node in cfg.nodes.values() if node.label == "goto nested;")
+        label = next(node for node in cfg.nodes.values() if node.label == "Label nested")
+        returned = next(node for node in cfg.nodes.values() if node.label == "return value;")
+
+        assert goto.successors == [label]
+        assert label.successors == [returned]
+
+    def test_lambda_labels_are_not_function_goto_targets(self, parser, tmp_path):
+        code = """
+        int run() {
+            auto callback = []() {
+            local:
+                return 0;
+            };
+            return callback();
+        }
+        """
+        cfg = parser.build_cfg(write_temp_cpp(tmp_path, code))
+
+        assert not any(node.label == "Label local" for node in cfg.nodes.values())
+        assert calculate_complexity(cfg)["complexity"] == 1
+
+    @pytest.mark.parametrize(
+        ("source", "message"),
+        [
+            ("int run() { goto missing; }", "goto target label"),
+            (
+                "int run() { same: return 0; same: return 1; }",
+                "Duplicate C\\+\\+ label: same",
+            ),
+        ],
+    )
+    def test_goto_label_errors_are_reported(self, parser, tmp_path, source, message):
+        with pytest.raises(ValueError, match=message):
+            parser.build_cfg(write_temp_cpp(tmp_path, source))
+
+    @pytest.mark.skipif(
+        not any(shutil.which(name) for name in ("g++", "clang++", "c++")),
+        reason="GCC or Clang is required to test C++ macro preprocessing",
+    )
+    def test_macro_expansion_and_included_header_macros(self, parser, tmp_path):
+        (tmp_path / "analysis_macros.h").write_text(
+            "#define IS_NEGATIVE(value) ((value) < 0)\n"
+            "#define LIMIT 10\n",
+            encoding="utf-8",
+        )
+        code = """
+        #include "analysis_macros.h"
+        int run(int value) {
+            if (IS_NEGATIVE(value)) {
+                return -1;
+            }
+            if (value > LIMIT) {
+                return 1;
+            }
+            return 0;
+        }
+        """
+        cfg = parser.build_cfg(write_temp_cpp(tmp_path, code))
+
+        assert calculate_complexity(cfg)["complexity"] == 3
+        assert any(node.label == "(value) < 0" for node in cfg.nodes.values())
+        assert len(find_independent_paths(cfg)) == 3

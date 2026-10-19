@@ -8,6 +8,10 @@ class CppCFGBuilder:
         self.exit_node = None
         self.loop_stack = []
         self.source_bytes = source_bytes
+        self.label_nodes: dict[str, CFGNode] = {}
+        self.referenced_labels: set[str] = set()
+        self.jumped_labels: set[str] = set()
+        self.processed_labels: set[str] = set()
 
     def add_node(self, label: str) -> CFGNode:
         """Creates a standardized CFGNode, adds it to the graph, and returns the object."""
@@ -32,14 +36,50 @@ class CppCFGBuilder:
         if root_node.has_error:
             raise ValueError("C++ source contains syntax errors")
 
-        # Extract function definitions
-        functions = [
-            child for child in root_node.named_children
-            if child.type == "function_definition"
-        ]
+        # Analyze every function definition in source order, including
+        # definitions nested inside namespaces and classes.
+        functions = []
+
+        def collect_functions(node):
+            if node.type == "function_definition":
+                functions.append(node)
+            for child in node.named_children:
+                collect_functions(child)
+
+        collect_functions(root_node)
 
         if not functions:
             raise ValueError("No function definition found")
+
+        if len(functions) == 1:
+            return self.build_function(functions[0])
+
+        member_cfgs = []
+        for function in functions:
+            member_builder = CppCFGBuilder(self.source_bytes)
+            member_cfgs.append(
+                (
+                    self.text(function.child_by_field_name("declarator")),
+                    member_builder.build_function(function),
+                )
+            )
+        return self.combine_cfgs(member_cfgs)
+
+    def build_function(self, function_node) -> CFG:
+        self.label_nodes = {}
+        self.referenced_labels = set()
+        self.jumped_labels = set()
+        self.processed_labels = set()
+        body = function_node.child_by_field_name("body")
+        self.collect_gotos_and_labels(body)
+        missing_labels = sorted(
+            self.referenced_labels - self.label_nodes.keys()
+        )
+        if missing_labels:
+            raise ValueError(
+                "C++ goto target label(s) not found: "
+                + ", ".join(missing_labels)
+            )
 
         # Initialize Standardized Entry and Exit points
         entry = self.add_node("Entry")
@@ -48,13 +88,72 @@ class CppCFGBuilder:
         self.cfg.start_node = entry
         self.cfg.end_node = self.exit_node
 
-        body = functions[0].child_by_field_name("body")
         tails = self.process_block(body, [entry])
 
         for tail in tails:
             self.add_edge(tail, self.exit_node)
 
         return self.cfg
+
+    def collect_gotos_and_labels(self, node) -> None:
+        if node is None or node.type == "lambda_expression":
+            return
+
+        if node.type == "labeled_statement":
+            label_node = node.child_by_field_name("label")
+            label = self.text(label_node)
+            if not label:
+                raise ValueError("C++ labeled statement has an empty label")
+            if label in self.label_nodes:
+                raise ValueError(f"Duplicate C++ label: {label}")
+            self.label_nodes[label] = self.add_node(f"Label {label}")
+
+        elif node.type == "goto_statement":
+            label_node = node.child_by_field_name("label")
+            label = self.text(label_node)
+            if not label:
+                raise ValueError("C++ goto statement has no target label")
+            self.referenced_labels.add(label)
+
+        for child in node.named_children:
+            self.collect_gotos_and_labels(child)
+
+    @staticmethod
+    def combine_cfgs(member_cfgs: list[tuple[str, CFG]]) -> CFG:
+        combined = CFG()
+        entry = CFGNode(1, "Entry")
+        exit_node = CFGNode(2, "Exit")
+        combined.add_node(entry)
+        combined.add_node(exit_node)
+        combined.start_node = entry
+        combined.end_node = exit_node
+        next_id = 3
+
+        for name, member_cfg in member_cfgs:
+            id_map = {}
+            for old_id, old_node in member_cfg.nodes.items():
+                new_node = CFGNode(next_id, old_node.label)
+                combined.add_node(new_node)
+                id_map[old_id] = new_node
+                next_id += 1
+
+            for source_id, target_id in member_cfg.get_edges():
+                label = member_cfg.edge_labels.get((source_id, target_id), "")
+                combined.add_edge(id_map[source_id], id_map[target_id], label)
+
+            if member_cfg.start_node is not None:
+                combined.add_edge(
+                    entry,
+                    id_map[member_cfg.start_node.node_id],
+                    f"function: {name}",
+                )
+            if member_cfg.end_node is not None:
+                combined.add_edge(
+                    id_map[member_cfg.end_node.node_id],
+                    exit_node,
+                )
+
+        return combined
 
     # ---------------------------------------------------------
     # Statement blocks
@@ -76,7 +175,13 @@ class CppCFGBuilder:
 
         for statement in statements:
             if not tails:
-                break
+                if statement.type != "labeled_statement":
+                    self.process_pending_labels(statement)
+                    continue
+                label = self.text(statement.child_by_field_name("label"))
+                if label not in self.jumped_labels:
+                    self.process_pending_labels(statement)
+                    continue
 
             kind = statement.type
 
@@ -122,6 +227,40 @@ class CppCFGBuilder:
                         self.add_edge(cont_node, target)
                 tails = []
 
+            elif kind == "goto_statement":
+                label = self.text(statement.child_by_field_name("label"))
+                goto_node = self.add_node(self.text(statement))
+                for tail in tails:
+                    self.add_edge(tail, goto_node)
+                target = self.label_nodes.get(label)
+                if target is None:
+                    raise ValueError(f"C++ goto target label not found: {label}")
+                self.add_edge(goto_node, target, "Goto")
+                self.jumped_labels.add(label)
+                tails = []
+
+            elif kind == "labeled_statement":
+                label_node = statement.child_by_field_name("label")
+                label = self.text(label_node)
+                if label in self.processed_labels:
+                    continue
+                self.processed_labels.add(label)
+                label_entry = self.label_nodes[label]
+                for tail in tails:
+                    self.add_edge(tail, label_entry)
+                label_span = (
+                    label_node.start_byte,
+                    label_node.end_byte,
+                )
+                body = next(
+                    (
+                        child for child in statement.named_children
+                        if (child.start_byte, child.end_byte) != label_span
+                    ),
+                    None,
+                )
+                tails = self.process_block(body, [label_entry]) if body else [label_entry]
+
             elif kind == "compound_statement":
                 tails = self.process_block(statement, tails)
 
@@ -132,6 +271,21 @@ class CppCFGBuilder:
                 tails = [stmt_node]
 
         return tails
+
+    def process_pending_labels(self, node) -> None:
+        if node.type == "lambda_expression":
+            return
+
+        if node.type == "labeled_statement":
+            label = self.text(node.child_by_field_name("label"))
+            if (
+                label in self.jumped_labels
+                and label not in self.processed_labels
+            ):
+                self.process_statements([node], [])
+
+        for child in node.named_children:
+            self.process_pending_labels(child)
 
     # ---------------------------------------------------------
     # Boolean condition builder
